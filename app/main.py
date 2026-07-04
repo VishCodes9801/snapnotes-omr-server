@@ -7,10 +7,13 @@ Endpoints:
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
+import re
 import secrets
 import shutil
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -122,6 +125,84 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# ── Anonymous usage tallies ──────────────────────────────────────────────────
+#
+# The app reports bare event names ("scan_succeeded"); we keep one integer
+# per name. No identifiers, no per-user rows, no timestamps beyond the log
+# line — the data can answer "how many scans succeeded" and nothing about
+# any individual. Storage is a JSON file next to the OMR cache, which on
+# Fly persists across machine stop/start but resets on redeploy; every
+# event is also logged, so history is recoverable from `fly logs` if it
+# ever matters.
+
+_EVENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+_MAX_EVENTS_PER_REQUEST = 20
+_MAX_COUNT_PER_EVENT = 100
+
+_STATS_PATH = Path(
+    os.getenv("SNAPNOTES_STATS_PATH", "cache/usage_stats.json")
+)
+_stats_lock = asyncio.Lock()
+
+
+def _load_stats() -> dict[str, int]:
+    try:
+        raw = json.loads(_STATS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        k: int(v)
+        for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, (int, float))
+    }
+
+
+@app.post("/events")
+@limiter.limit("30/minute")
+async def events(request: Request) -> dict:
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — malformed JSON of any flavour
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    counts = body.get("counts") if isinstance(body, dict) else None
+    if not isinstance(counts, dict) or not counts:
+        raise HTTPException(status_code=400, detail="missing counts")
+    if len(counts) > _MAX_EVENTS_PER_REQUEST:
+        raise HTTPException(status_code=400, detail="too many events")
+    cleaned: dict[str, int] = {}
+    for name, n in counts.items():
+        if not isinstance(name, str) or not _EVENT_NAME_RE.match(name):
+            raise HTTPException(
+                status_code=400, detail=f"bad event name: {name!r}"
+            )
+        if not isinstance(n, int) or not 1 <= n <= _MAX_COUNT_PER_EVENT:
+            raise HTTPException(
+                status_code=400, detail=f"bad count for {name}"
+            )
+        cleaned[name] = n
+
+    async with _stats_lock:
+        stats = _load_stats()
+        for name, n in cleaned.items():
+            stats[name] = stats.get(name, 0) + n
+        try:
+            _STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _STATS_PATH.write_text(json.dumps(stats))
+        except OSError:
+            log.warning("stats write failed (non-fatal)", exc_info=True)
+    log.info("events: %s", cleaned)
+    return {"ok": True}
+
+
+@app.get("/stats")
+async def stats(request: Request) -> dict:
+    """Aggregate counters, for the operator (token-gated like /extract)."""
+    _check_auth(request)
+    async with _stats_lock:
+        return {"counts": _load_stats()}
 
 
 @app.post("/extract")
