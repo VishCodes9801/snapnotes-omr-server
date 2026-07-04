@@ -1,0 +1,25 @@
+# 0.136.3 was flagged for a tampered standard-extras dependency
+# (osv MAL-2026-4750); 0.135.4 is the latest clean release. We don't
+# use [standard] anyway, but pin to a clean upstream version.
+fastapi==0.135.4
+uvicorn[standard]==0.48.0
+python-multipart==0.0.29
+# Transitive of fastapi, pinned explicitly to keep CVE-2024-47874 /
+# CVE-2025-54121 / PYSEC-2026-161 patched even if a future fastapi bump
+# loosens its lower bound.
+starlette>=1.0.1
+
+# MusicXML parsing / pitch and beat conversion.
+# Audiveris does the OMR itself; Python only handles HTTP + post-processing.
+music21==9.1.0
+
+# Image handling helper (validate uploaded bytes are a real image).
+pillow==12.2.0
+
+# Used by the OMR pre-processing pipeline (deskew via row-projection
+# variance + cheap pixel math for autocontrast / sharpening).
+numpy==2.1.0
+
+# Per-IP request throttling on /extract — each call spins up a 2 GB
+# Audiveris JVM, so a small burst from one client must not pin the worker.
+slowapi==0.1.9
