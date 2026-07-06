@@ -130,6 +130,7 @@ def detect_system_bands(
     pad = interline * 2.0
     bands: list[list[float]] = []
     extents: list[tuple[float, float]] = []
+    barlines: list[list[float]] = []
     for group in grouped:
         y0 = max(0.0, group[0][0] - pad)
         y1 = min(float(height - 1), group[-1][1] + pad)
@@ -145,6 +146,9 @@ def detect_system_bands(
             )
         else:
             extents.append((cols[0] / width, (cols[-1] + 1) / width))
+        barlines.append(
+            _detect_barlines(full_ink, r0, r1, interline, width)
+        )
 
     # Sanity: bands must be ordered and non-overlapping (small overlaps
     # from generous padding are clipped to the midpoint).
@@ -159,9 +163,55 @@ def detect_system_bands(
             "y1": round(b[1], 4),
             "x0": round(e[0], 4),
             "x1": round(e[1], 4),
+            # Candidate barline x-positions (normalized). main.py keeps
+            # them only when the count agrees with the MusicXML measure
+            # count; the client's playhead then interpolates between the
+            # *actual* barlines instead of assuming even spacing.
+            "bars": bars,
         }
-        for b, e in zip(bands, extents)
+        for b, e, bars in zip(bands, extents, barlines)
     ]
+
+
+def _detect_barlines(
+    full_ink: np.ndarray, r0: int, r1: int, interline: float, width: int
+) -> list[float]:
+    """Barline x-centers for the system occupying rows [r0, r1): thin
+    columns whose ink spans nearly the whole system height. Note stems
+    only cross one staff (and never the gap between staves of a grand
+    staff / choir system), so a high full-height threshold separates
+    barlines cleanly. Returns normalized x centers, left to right."""
+    if r1 - r0 < 8:
+        return []
+    col_ratio = full_ink[r0:r1].mean(axis=0)
+    candidates = np.where(col_ratio >= 0.82)[0]
+    if len(candidates) == 0:
+        return []
+    max_run = max(3.0, interline * 0.7)  # barlines are thin; blobs aren't
+    centers: list[float] = []
+    run_start = candidates[0]
+    prev = candidates[0]
+    for c in candidates[1:]:
+        if c > prev + 2:
+            if prev - run_start <= max_run:
+                centers.append((run_start + prev) / 2.0)
+            run_start = c
+        prev = c
+    if prev - run_start <= max_run:
+        centers.append((run_start + prev) / 2.0)
+
+    # Collapse clusters: a line's opening (bracket + brace + barline) and
+    # closing (final double bar) produce several full-height verticals a
+    # few pixels apart that are one musical boundary. Keep the rightmost
+    # of each cluster — that's the barline proper.
+    cluster_gap = max(6.0, interline * 1.4)
+    collapsed: list[float] = []
+    for c in centers:
+        if collapsed and c - collapsed[-1] <= cluster_gap:
+            collapsed[-1] = c
+        else:
+            collapsed.append(c)
+    return [round(c / width, 4) for c in collapsed]
 
 
 def _group_by_gaps(

@@ -349,6 +349,10 @@ def _measure_system_map(parts) -> tuple[list[dict[str, Any]], int]:
         out.append({
             "beat": float(m.offset),
             "system": bisect_right(break_numbers, num),
+            # Printed measure identity — repeat expansion reuses numbers,
+            # letting downstream tell "5 plays of this line" apart from
+            # "5 printed measures on this line".
+            "number": num,
         })
     out.sort(key=lambda e: e["beat"])
     return out, len(break_numbers) + 1

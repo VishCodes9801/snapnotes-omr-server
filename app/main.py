@@ -424,6 +424,32 @@ _SCORE_PAGE_MAX_WIDTH = 1100
 _SCORE_PAGE_JPEG_QUALITY = 70
 
 
+def _measure_xs(
+    bars: list, n_measures: int, band: dict
+) -> list[float] | None:
+    """Reconcile detected barlines with the printed measure count. A line
+    with N measures has N+1 boundaries; engravers often omit the leading
+    barline (the clef/key area opens the line), so N detected barlines
+    are treated as the N trailing boundaries with the staff's left edge
+    prepended. Anything else → None, and the client falls back to even
+    spacing rather than trusting bad geometry."""
+    if not bars or n_measures < 1:
+        return None
+    xs: list[float] | None = None
+    if len(bars) == n_measures + 1:
+        xs = [float(b) for b in bars]
+    elif len(bars) == n_measures:
+        xs = [float(band.get("x0", 0.0)), *(float(b) for b in bars)]
+    if xs is None:
+        return None
+    # Boundaries must strictly advance; a repeat sign / thick double bar
+    # occasionally splits into two detections that violate this.
+    for a, b in zip(xs, xs[1:]):
+        if b - a <= 0.005:
+            return None
+    return xs
+
+
 def _build_score_page(png_path, page: dict, page_offset: float) -> dict:
     """Assemble one score-view page: the preprocessed image (downscaled
     JPEG, base64) plus normalized system bands with their start beats.
@@ -461,19 +487,26 @@ def _build_score_page(png_path, page: dict, page_offset: float) -> dict:
         # a line contributes its beats to that line again, which is what
         # the client's playhead wants.
         by_system: dict[int, list[float]] = {}
+        printed: dict[int, set[int]] = {}
         for m in measures:
-            by_system.setdefault(int(m["system"]), []).append(
+            s = int(m["system"])
+            by_system.setdefault(s, []).append(
                 float(m["beat"]) + page_offset
             )
+            printed.setdefault(s, set()).add(int(m.get("number", 0)))
         if all(s in by_system for s in range(len(bands))):
-            systems = [
-                {
+            systems = []
+            for idx, band in enumerate(bands):
+                bars = band.pop("bars", []) or []
+                xs = _measure_xs(bars, len(printed[idx]), band)
+                entry = {
                     **band,
                     "beat": min(by_system[idx]),
                     "measures": sorted(by_system[idx]),
                 }
-                for idx, band in enumerate(bands)
-            ]
+                if xs:
+                    entry["measure_xs"] = xs
+                systems.append(entry)
     if not systems:
         log.info(
             "score page: system fallback (image bands=%d, xml systems=%d)",
