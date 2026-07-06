@@ -15,10 +15,13 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from bisect import bisect_right
+
 import music21
 from music21 import dynamics as m21_dynamics
 from music21 import expressions as m21_expressions
 from music21 import key as m21_key
+from music21 import layout as m21_layout
 from music21 import meter as m21_meter
 from music21 import stream as m21_stream
 from music21 import tempo as m21_tempo
@@ -289,12 +292,66 @@ def musicxml_to_payload(
         )),
         total_dynamic_markings,
     )
+    measures_map, system_count = _measure_system_map(parts)
     return {
         "bpm": bpm,
         "notes": events,
         "total_beats": total_beats,
         "meta": meta,
+        # Score-view sync data: chronological measure start-beats with
+        # the printed system (line of music) each belongs to. Repeats are
+        # already expanded, so a jump back to an earlier line falls out
+        # naturally (the same printed measure appears twice with two
+        # different beats).
+        "measures": measures_map,
+        "system_count": system_count,
     }
+
+
+def _measure_system_map(parts) -> tuple[list[dict[str, Any]], int]:
+    """Chronological `{beat, system}` for each measure of the lead part,
+    plus the number of printed systems (from MusicXML new-system layout
+    breaks). Audiveris always emits system breaks for its own layout, so
+    the count matches what's physically on the page; if none are found
+    the page is a single system.
+
+    Measure *numbers* index the printed page (stable across repeat
+    expansion); measure *offsets* are playback beats. Mapping goes
+    number → system via the sorted break-numbers list."""
+    if not parts:
+        return [], 1
+    measures = list(parts[0].getElementsByClass(m21_stream.Measure))
+    if not measures:
+        return [], 1
+
+    break_numbers: list[int] = []
+    seen: set[int] = set()
+    for m in measures:
+        num = int(m.number or 0)
+        if num in seen:
+            continue  # repeat expansion revisits printed measures
+        seen.add(num)
+        for sl in m.getElementsByClass(m21_layout.SystemLayout):
+            if getattr(sl, "isNew", False):
+                break_numbers.append(num)
+                break
+    break_numbers.sort()
+    # A new-system flag on the very first measure marks the layout start,
+    # not a break — dropping it keeps system indices 0-based and the
+    # count honest.
+    first_num = int(measures[0].number or 0)
+    if break_numbers and break_numbers[0] <= first_num:
+        break_numbers.pop(0)
+
+    out = []
+    for m in measures:
+        num = int(m.number or 0)
+        out.append({
+            "beat": float(m.offset),
+            "system": bisect_right(break_numbers, num),
+        })
+    out.sort(key=lambda e: e["beat"])
+    return out, len(break_numbers) + 1
 
 
 def _compensate_cumulative_drift(score) -> int:

@@ -1,0 +1,159 @@
+"""Detects the vertical bands of music systems on a (preprocessed) sheet
+image, so the client can highlight the line being played in the score
+view. Pure image processing — no Audiveris internals: staff lines are
+near-full-width dark rows, which makes a horizontal projection profile a
+very reliable detector on the deskewed images this pipeline produces."""
+
+import io
+import logging
+
+import numpy as np
+from PIL import Image
+
+log = logging.getLogger("snapnotes.layout")
+
+# Work on a bounded-size thumbnail; bands are returned normalized so the
+# original resolution is irrelevant.
+_ANALYSIS_WIDTH = 1000
+
+# A row counts as a "staff-line row" when at least this fraction of its
+# pixels are ink. Staff lines span most of the page width; note stems,
+# beams, and text never get close on a full-width row basis.
+_ROW_INK_THRESHOLD = 0.35
+
+
+def detect_system_bands(
+    png_bytes: bytes, staves_per_system: int
+) -> list[tuple[float, float]]:
+    """Return normalized (y0, y1) bands, one per music system, top to
+    bottom — or [] when detection isn't confident (caller falls back to
+    page-level sync). `staves_per_system` comes from the MusicXML part
+    count (a piano grand staff arrives from Audiveris as two parts)."""
+    try:
+        im = Image.open(io.BytesIO(png_bytes))
+        im.load()
+    except Exception:  # noqa: BLE001
+        return []
+    if im.mode != "L":
+        im = im.convert("L")
+    w, h = im.size
+    if w > _ANALYSIS_WIDTH:
+        im = im.resize(
+            (_ANALYSIS_WIDTH, max(1, round(h * _ANALYSIS_WIDTH / w))),
+            Image.BILINEAR,
+        )
+    arr = np.asarray(im, dtype=np.uint8)
+    height = arr.shape[0]
+    if height < 40:
+        return []
+
+    # Ink fraction per row, measured over the content's horizontal extent
+    # (staff lines span the *music*, not necessarily the page margins).
+    ink = arr < 200
+    col_has_ink = ink.mean(axis=0) > 0.01
+    cols = np.where(col_has_ink)[0]
+    if len(cols) < 20:
+        return []
+    ink = ink[:, cols[0] : cols[-1] + 1]
+    row_ratio = ink.mean(axis=1)
+
+    line_rows = np.where(row_ratio >= _ROW_INK_THRESHOLD)[0]
+    if len(line_rows) < 5 * max(1, staves_per_system):
+        return []
+
+    # Runs of adjacent rows = individual staff lines (a line is 1–4 rows
+    # thick at this scale). Collect each line's center.
+    centers: list[float] = []
+    run_start = line_rows[0]
+    prev = line_rows[0]
+    for r in line_rows[1:]:
+        if r > prev + 2:
+            centers.append((run_start + prev) / 2.0)
+            run_start = r
+        prev = r
+    centers.append((run_start + prev) / 2.0)
+    if len(centers) < 5:
+        return []
+
+    # Interline = the typical gap between adjacent staff lines. Use the
+    # median of the smaller half of gaps (gaps between staves/systems
+    # pollute the upper half).
+    gaps = np.diff(centers)
+    small_gaps = np.sort(gaps)[: max(1, len(gaps) // 2)]
+    interline = float(np.median(small_gaps))
+    if interline <= 0:
+        return []
+
+    # Group lines into staves: consecutive lines whose gap is staff-like.
+    staves: list[tuple[float, float]] = []  # (top line, bottom line)
+    start = centers[0]
+    prev_c = centers[0]
+    count = 1
+    for c in centers[1:]:
+        if c - prev_c <= interline * 1.8:
+            prev_c = c
+            count += 1
+        else:
+            if count >= 4:  # tolerate one merged/missed line per staff
+                staves.append((start, prev_c))
+            start = c
+            prev_c = c
+            count = 1
+    if count >= 4:
+        staves.append((start, prev_c))
+
+    if not staves:
+        return []
+
+    # Group staves into systems. Preferred: the MusicXML told us how many
+    # staves each system has and the count divides cleanly. Fallback: gap
+    # clustering (intra-system staff gaps are smaller than inter-system
+    # gaps).
+    n = len(staves)
+    sps = max(1, staves_per_system)
+    if n % sps == 0:
+        grouped = [staves[i : i + sps] for i in range(0, n, sps)]
+    elif sps > 1:
+        grouped = _group_by_gaps(staves)
+        if not grouped:
+            return []
+    else:
+        grouped = [[s] for s in staves]
+
+    pad = interline * 2.0
+    bands: list[tuple[float, float]] = []
+    for group in grouped:
+        y0 = max(0.0, group[0][0] - pad)
+        y1 = min(float(height - 1), group[-1][1] + pad)
+        bands.append((y0 / height, y1 / height))
+
+    # Sanity: bands must be ordered and non-overlapping (small overlaps
+    # from generous padding are clipped to the midpoint).
+    for i in range(1, len(bands)):
+        if bands[i][0] < bands[i - 1][1]:
+            mid = (bands[i][0] + bands[i - 1][1]) / 2.0
+            bands[i - 1] = (bands[i - 1][0], mid)
+            bands[i] = (mid, bands[i][1])
+    return bands
+
+
+def _group_by_gaps(
+    staves: list[tuple[float, float]],
+) -> list[list[tuple[float, float]]]:
+    """Cluster staves into systems by the gaps between them: gaps within
+    a system (grand-staff spacing) are markedly smaller than gaps between
+    systems. Splits at gaps larger than 1.6× the smallest gap. Returns []
+    when there's only one gap size to compare (no confidence)."""
+    if len(staves) < 2:
+        return [staves]
+    gaps = [staves[i + 1][0] - staves[i][1] for i in range(len(staves) - 1)]
+    smallest = min(gaps)
+    if smallest <= 0:
+        return []
+    groups: list[list[tuple[float, float]]] = [[staves[0]]]
+    for stave, gap in zip(staves[1:], gaps):
+        if gap > smallest * 1.6:
+            groups.append([stave])
+        else:
+            groups[-1].append(stave)
+    return groups

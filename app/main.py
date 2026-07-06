@@ -7,6 +7,7 @@ Endpoints:
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import os
@@ -24,8 +25,11 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 from starlette.responses import JSONResponse
 
+import base64
+
 from . import cache
 from .convert import musicxml_to_payload
+from .layout import detect_system_bands
 from .omr import PIPELINE_VERSION, VALID_QUALITIES, OmrError, run_audiveris
 
 logging.basicConfig(level=logging.INFO)
@@ -212,6 +216,7 @@ async def extract(
     images: list[UploadFile] = File(...),
     force: bool = False,
     quality: str = "Standard",
+    include_pages: bool = False,
 ) -> dict:
     _check_auth(request)
 
@@ -239,7 +244,11 @@ async def extract(
     # to allocate a single buffer the size of every page concatenated
     # (which could be up to MAX_TOTAL_UPLOAD_BYTES = 200 MB).
     hasher = hashlib.sha256()
-    hasher.update(f"{PIPELINE_VERSION}|{quality}|".encode())
+    # include_pages is part of the key: the payloads differ (score-view
+    # page images + system geometry vs notes only).
+    hasher.update(
+        f"{PIPELINE_VERSION}|{quality}|pages={int(include_pages)}|".encode()
+    )
     for img in images:
         raw = await img.read()
         if not raw:
@@ -292,6 +301,7 @@ async def extract(
     offset = 0.0
     page_boundaries: list[float] = []  # offset at the start of each page > 0
     page_metas: list[dict] = []
+    score_pages: list[dict] = []
     # Track the most recently-seen time signature so later pages whose
     # MusicXML lacks one inherit it directly into the music21 score
     # (and therefore through drift compensation). Without this, pages
@@ -307,6 +317,14 @@ async def extract(
                 xml_path,
                 fallback_time_signature=known_time_signature,
             )
+            if include_pages:
+                # The preprocessed PNG is the image Audiveris actually
+                # read, so its pixels and the detected geometry always
+                # agree — regardless of what preprocessing did to the
+                # upload.
+                score_pages.append(
+                    _build_score_page(workdir / "input.png", page, offset)
+                )
         except OmrError as exc:
             # OmrError messages are intentionally user-facing (e.g.
             # "Image resolution too low"); safe to forward to the client.
@@ -378,6 +396,8 @@ async def extract(
         "bpm": bpm if bpm is not None else 90.0,
         "notes": sanitized,
     }
+    if include_pages:
+        payload["score_pages"] = score_pages
     if page_metas:
         payload["meta"] = {
             "pages": page_metas,
@@ -396,6 +416,73 @@ async def extract(
         len(raws),
     )
     return payload
+
+
+# Score-view page images: bounded width keeps a page around 60–150 KB
+# as a JPEG — enough resolution to read the notation on a phone panel.
+_SCORE_PAGE_MAX_WIDTH = 1100
+_SCORE_PAGE_JPEG_QUALITY = 70
+
+
+def _build_score_page(png_path, page: dict, page_offset: float) -> dict:
+    """Assemble one score-view page: the preprocessed image (downscaled
+    JPEG, base64) plus normalized system bands with their start beats.
+    System geometry comes from the image (projection profile) and the
+    system *membership* from MusicXML layout breaks; when the two
+    disagree the page ships without systems and the client falls back to
+    page-level sync."""
+    from PIL import Image  # local import keeps module import cheap
+
+    png_bytes = png_path.read_bytes()
+    im = Image.open(io.BytesIO(png_bytes))
+    im.load()
+    if im.mode != "L":
+        im = im.convert("L")
+    if im.width > _SCORE_PAGE_MAX_WIDTH:
+        im = im.resize(
+            (
+                _SCORE_PAGE_MAX_WIDTH,
+                max(1, round(im.height * _SCORE_PAGE_MAX_WIDTH / im.width)),
+            ),
+            Image.BILINEAR,
+        )
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=_SCORE_PAGE_JPEG_QUALITY)
+    image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    staves_per_system = int(page.get("meta", {}).get("parts") or 2)
+    bands = detect_system_bands(png_bytes, staves_per_system)
+    n_sys_xml = int(page.get("system_count") or 1)
+    measures = page.get("measures") or []
+
+    systems: list[dict] = []
+    if bands and len(bands) == n_sys_xml and measures:
+        first_beat: dict[int, float] = {}
+        for m in measures:
+            s = int(m["system"])
+            b = float(m["beat"])
+            if s not in first_beat or b < first_beat[s]:
+                first_beat[s] = b
+        if all(s in first_beat for s in range(len(bands))):
+            systems = [
+                {
+                    "y0": round(band[0], 4),
+                    "y1": round(band[1], 4),
+                    "beat": first_beat[idx] + page_offset,
+                }
+                for idx, band in enumerate(bands)
+            ]
+    if not systems:
+        log.info(
+            "score page: system fallback (image bands=%d, xml systems=%d)",
+            len(bands),
+            n_sys_xml,
+        )
+    return {
+        "image": image_b64,
+        "start_beat": page_offset,
+        "systems": systems,
+    }
 
 
 _PIANO_MIDI_LOW = 21    # A0
