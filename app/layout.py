@@ -24,11 +24,17 @@ _ROW_INK_THRESHOLD = 0.35
 
 def detect_system_bands(
     png_bytes: bytes, staves_per_system: int
-) -> list[tuple[float, float]]:
-    """Return normalized (y0, y1) bands, one per music system, top to
-    bottom — or [] when detection isn't confident (caller falls back to
-    page-level sync). `staves_per_system` comes from the MusicXML part
-    count (a piano grand staff arrives from Audiveris as two parts)."""
+) -> list[dict]:
+    """Return one dict per music system, top to bottom — or [] when
+    detection isn't confident (caller falls back to page-level sync):
+
+        {"y0", "y1": normalized vertical band,
+         "x0", "x1": normalized horizontal extent of the staff lines}
+
+    The x extent drives the client's moving playhead: beats map onto the
+    line between x0 and x1. `staves_per_system` comes from the MusicXML
+    part count (a piano grand staff arrives from Audiveris as two
+    parts)."""
     try:
         im = Image.open(io.BytesIO(png_bytes))
         im.load()
@@ -49,12 +55,13 @@ def detect_system_bands(
 
     # Ink fraction per row, measured over the content's horizontal extent
     # (staff lines span the *music*, not necessarily the page margins).
-    ink = arr < 200
-    col_has_ink = ink.mean(axis=0) > 0.01
+    full_ink = arr < 200
+    col_has_ink = full_ink.mean(axis=0) > 0.01
     cols = np.where(col_has_ink)[0]
     if len(cols) < 20:
         return []
-    ink = ink[:, cols[0] : cols[-1] + 1]
+    width = arr.shape[1]
+    ink = full_ink[:, cols[0] : cols[-1] + 1]
     row_ratio = ink.mean(axis=1)
 
     line_rows = np.where(row_ratio >= _ROW_INK_THRESHOLD)[0]
@@ -121,20 +128,40 @@ def detect_system_bands(
         grouped = [[s] for s in staves]
 
     pad = interline * 2.0
-    bands: list[tuple[float, float]] = []
+    bands: list[list[float]] = []
+    extents: list[tuple[float, float]] = []
     for group in grouped:
         y0 = max(0.0, group[0][0] - pad)
         y1 = min(float(height - 1), group[-1][1] + pad)
-        bands.append((y0 / height, y1 / height))
+        bands.append([y0 / height, y1 / height])
+        # Horizontal extent of this system's staff lines: ink columns
+        # within the (unpadded) staff rows. Drives the playhead range.
+        r0 = int(group[0][0])
+        r1 = int(group[-1][1]) + 1
+        band_cols = np.where(full_ink[r0:r1].mean(axis=0) > 0.02)[0]
+        if len(band_cols) >= 10:
+            extents.append(
+                (band_cols[0] / width, (band_cols[-1] + 1) / width)
+            )
+        else:
+            extents.append((cols[0] / width, (cols[-1] + 1) / width))
 
     # Sanity: bands must be ordered and non-overlapping (small overlaps
     # from generous padding are clipped to the midpoint).
     for i in range(1, len(bands)):
         if bands[i][0] < bands[i - 1][1]:
             mid = (bands[i][0] + bands[i - 1][1]) / 2.0
-            bands[i - 1] = (bands[i - 1][0], mid)
-            bands[i] = (mid, bands[i][1])
-    return bands
+            bands[i - 1][1] = mid
+            bands[i][0] = mid
+    return [
+        {
+            "y0": round(b[0], 4),
+            "y1": round(b[1], 4),
+            "x0": round(e[0], 4),
+            "x1": round(e[1], 4),
+        }
+        for b, e in zip(bands, extents)
+    ]
 
 
 def _group_by_gaps(

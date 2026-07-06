@@ -457,18 +457,20 @@ def _build_score_page(png_path, page: dict, page_offset: float) -> dict:
 
     systems: list[dict] = []
     if bands and len(bands) == n_sys_xml and measures:
-        first_beat: dict[int, float] = {}
+        # Chronological measure beats per system; a repeat that revisits
+        # a line contributes its beats to that line again, which is what
+        # the client's playhead wants.
+        by_system: dict[int, list[float]] = {}
         for m in measures:
-            s = int(m["system"])
-            b = float(m["beat"])
-            if s not in first_beat or b < first_beat[s]:
-                first_beat[s] = b
-        if all(s in first_beat for s in range(len(bands))):
+            by_system.setdefault(int(m["system"]), []).append(
+                float(m["beat"]) + page_offset
+            )
+        if all(s in by_system for s in range(len(bands))):
             systems = [
                 {
-                    "y0": round(band[0], 4),
-                    "y1": round(band[1], 4),
-                    "beat": first_beat[idx] + page_offset,
+                    **band,
+                    "beat": min(by_system[idx]),
+                    "measures": sorted(by_system[idx]),
                 }
                 for idx, band in enumerate(bands)
             ]
