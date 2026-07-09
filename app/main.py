@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 import base64
 
@@ -207,6 +208,111 @@ async def stats(request: Request) -> dict:
     _check_auth(request)
     async with _stats_lock:
         return {"counts": _load_stats()}
+
+
+# ── Audio rendering (practice video export) ────────────────────────────────
+# The app renders shareable clips client-side but can't synthesize audio
+# offline — fluidsynth here turns the song's MIDI into a WAV using the
+# same soundfont the app plays through. Mono 44.1 kHz keeps a 2-minute
+# song around 10 MB on the wire.
+
+_SOUNDFONT_PATH = os.getenv("SNAPNOTES_SOUNDFONT", "/opt/piano.sf2")
+_MAX_MIDI_BYTES = 1_000_000
+_MAX_AUDIO_SECONDS = 6 * 60
+_render_lock = asyncio.Lock()
+
+
+def _downmix_to_mono(wav_bytes: bytes) -> bytes:
+    """Stereo s16 WAV → mono s16 WAV, peak-normalized to ≈ -1 dBFS.
+    fluidsynth's default gain leaves piano around -21 dBFS; every song
+    should come back at the same healthy level. Gain is capped so a
+    nearly-silent render can't be blown up into noise."""
+    import array
+    import wave
+
+    with wave.open(io.BytesIO(wav_bytes), "rb") as src:
+        channels = src.getnchannels()
+        rate = src.getframerate()
+        frames = src.readframes(src.getnframes())
+    samples = array.array("h")
+    samples.frombytes(frames)
+    if channels > 1:
+        samples = array.array(
+            "h",
+            (
+                sum(samples[i + c] for c in range(channels)) // channels
+                for i in range(0, len(samples) - channels + 1, channels)
+            ),
+        )
+    peak = max(1, max(abs(min(samples)), max(samples)))
+    gain = min(29000 / peak, 12.0)
+    if gain > 1.05:
+        samples = array.array(
+            "h", (int(s * gain) for s in samples)
+        )
+    out = io.BytesIO()
+    with wave.open(out, "wb") as dst:
+        dst.setnchannels(1)
+        dst.setsampwidth(2)
+        dst.setframerate(rate)
+        dst.writeframes(samples.tobytes())
+    return out.getvalue()
+
+
+@app.post("/render-audio")
+@limiter.limit("10/minute")
+async def render_audio(
+    request: Request,
+    midi: UploadFile = File(...),
+) -> Response:
+    _check_auth(request)
+    data = await midi.read()
+    if len(data) > _MAX_MIDI_BYTES:
+        raise HTTPException(status_code=413, detail="MIDI too large")
+    if not data.startswith(b"MThd"):
+        raise HTTPException(status_code=400, detail="not a MIDI file")
+    if not Path(_SOUNDFONT_PATH).exists():
+        raise HTTPException(status_code=503, detail="soundfont not installed")
+
+    key = hashlib.sha256(b"audio-v2|" + data).hexdigest()
+    if (cached := cache.get_blob(key, ".wav")) is not None:
+        return Response(content=cached, media_type="audio/wav")
+
+    async with _render_lock:
+        with tempfile.TemporaryDirectory() as tmp:
+            mid_path = Path(tmp) / "in.mid"
+            wav_path = Path(tmp) / "out.wav"
+            mid_path.write_bytes(data)
+            proc = await asyncio.create_subprocess_exec(
+                "fluidsynth",
+                "-ni",
+                "-r",
+                "44100",
+                "-F",
+                str(wav_path),
+                _SOUNDFONT_PATH,
+                str(mid_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=180
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise HTTPException(status_code=504, detail="render timeout")
+            if proc.returncode != 0 or not wav_path.exists():
+                log.warning("fluidsynth failed: %s", (stderr or b"")[-400:])
+                raise HTTPException(status_code=500, detail="render failed")
+            # 44.1 kHz stereo s16 ≈ 176 KB/s → duration guard by size.
+            if wav_path.stat().st_size > _MAX_AUDIO_SECONDS * 180_000:
+                raise HTTPException(status_code=413, detail="song too long")
+            wav = wav_path.read_bytes()
+
+    mono = _downmix_to_mono(wav)
+    cache.put_blob(key, ".wav", mono)
+    return Response(content=mono, media_type="audio/wav")
 
 
 @app.post("/extract")

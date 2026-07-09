@@ -20,7 +20,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # dropped and Audiveris logs "no OCR languages installed".
         tesseract-ocr \
         tesseract-ocr-eng \
+        # fluidsynth renders song MIDI to WAV for the app's practice
+        # video export (/render-audio); bzip2 unpacks the soundfont below.
+        fluidsynth \
+        bzip2 \
     && rm -rf /var/lib/apt/lists/*
+
+# The same YDP Grand Piano soundfont the app bundles (FreePats, CC-BY 3.0)
+# so exported videos sound exactly like the app. Hash-pinned like the
+# Audiveris .deb: compute with `curl -sL <url> | sha256sum`.
+ARG SOUNDFONT_SHA256=d243dc3e182a60df2a16e92828c1821cf3eb5748b45e2e2bdcfa9cf7af056026
+RUN wget -O /tmp/ydp.tar.bz2 \
+        "https://freepats.zenvoid.org/Piano/YDP-GrandPiano/YDP-GrandPiano-SF2-20160804.tar.bz2" \
+    && echo "${SOUNDFONT_SHA256}  /tmp/ydp.tar.bz2" | sha256sum -c - \
+    && tar xjf /tmp/ydp.tar.bz2 -C /tmp \
+    && mv /tmp/YDP-GrandPiano-SF2-20160804/YDP-GrandPiano-20160804.sf2 /opt/piano.sf2 \
+    && rm -rf /tmp/ydp.tar.bz2 /tmp/YDP-GrandPiano-SF2-20160804
 
 # Pinned Audiveris release, verified by SHA-256 before install — a defense
 # against a tampered upstream release or CDN compromise. The default hash
