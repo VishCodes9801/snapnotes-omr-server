@@ -210,7 +210,10 @@ async def stats(request: Request) -> dict:
 
 
 @app.post("/extract")
-@limiter.limit("5/minute")
+# 5/min = burst control; 200/day = a loose backstop so even a stripped
+# API token can't run the compute bill up from one machine. Generous on
+# purpose: NAT'd campuses share IPs.
+@limiter.limit("5/minute;200/day")
 async def extract(
     request: Request,
     images: list[UploadFile] = File(...),
